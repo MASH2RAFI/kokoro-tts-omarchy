@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "mash2rafi.kokoro",
+  "name": "Kokoro TTS",
+  "version": "1.1.0",
+  "author": "MASH2RAFI",
+  "license": "Apache-2.0",
+  "description": "Local text-to-speech with the Kokoro-82M model: type or paste text, pick one of 41 voices, stream speech through PipeWire, optionally save WAV files. Settings for voice, speed, volume, GPU/CPU, saving, and idle unloading are kept in ~/.config/omarchy/kokoro-tts.json.",
+  "kinds": ["panel", "bar-widget"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "panel": "Panel.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Kokoro TTS",
+    "description": "Click to open the text-to-speech app; right-click to speak the selected text.",
+    "category": "Widgets",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
