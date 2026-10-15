@@ -82,6 +82,7 @@ Settings tab, or `~/.config/omarchy/kokoro-tts.json` (editable by hand; changes 
 | `hotkeySource` | `selection` | What speak-selection reads: `selection` (primary) or `clipboard` |
 | `floatingBar` | `true` | Show the play/pause pill when text is selected |
 | `skipSeconds` | `5` | How far the skip buttons jump |
+| `minSelectionChars` | `12` | Selections shorter than this (not counting spaces) don't show the floating bar |
 | `pythonPath` | *(empty)* | Override the Python interpreter (default `~/.local/share/kokoro-tts/venv/bin/python`) |
 
 ## Frosted glass

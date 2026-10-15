@@ -84,6 +84,7 @@ Item {
       property string hotkeySource: "selection"
       property bool floatingBar: true
       property real skipSeconds: 5
+      property int minSelectionChars: 12
       property string player: "auto"
       property string pythonPath: ""
       property string lastText: ""
@@ -103,6 +104,7 @@ Item {
     settings.hotkeySource = "selection"
     settings.floatingBar = true
     settings.skipSeconds = 5
+    settings.minSelectionChars = 12
     settings.player = "auto"
   }
 

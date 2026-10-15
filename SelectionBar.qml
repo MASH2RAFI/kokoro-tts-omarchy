@@ -25,6 +25,8 @@ Scope {
   property var targetScreen: null
   property real pointerX: 0        // pointer in the target screen's logical coordinates
   property real pointerY: 0
+  property real monitorX: 0        // target screen's position in the global layout (for screen sampling)
+  property real monitorY: 0
   property real dragX: 0           // how far the user dragged the capsule from its spot by the pointer
   property real dragY: 0
 
@@ -111,16 +113,16 @@ Scope {
 
   // ---------------------------------------------------------------- selection watcher
 
-  // wl-paste runs the script on every primary-selection change and prints
-  // "show" for real text, "hide" for empty, whitespace or sensitive content.
+  // wl-paste runs the script on every primary-selection change and prints how
+  // many non-space characters were selected (0 for empty or sensitive content,
+  // capped at 1000); the capsule shows once it reaches settings.minSelectionChars.
   property bool primed: false
 
   Process {
     id: watcher
     running: bar.active
     command: ["wl-paste", "--primary", "--watch", "sh", "-c",
-      "if [ \"$CLIPBOARD_STATE\" = data ] && [ -n \"$(tr -d '[:space:]' | head -c 1)\" ];"
-      + " then echo show; else echo hide; fi"]
+      "if [ \"$CLIPBOARD_STATE\" = data ]; then tr -d '[:space:]' | head -c 1000 | wc -m; else echo 0; fi"]
     stdout: SplitParser {
       onRead: function(data) { bar.selectionChanged(String(data || "").trim()) }
     }
@@ -134,10 +136,10 @@ Scope {
     onTriggered: if (bar.active) watcher.running = true
   }
 
-  function selectionChanged(state) {
+  function selectionChanged(count) {
     // The first event is whatever was already selected when the watch began.
     if (!bar.primed) { bar.primed = true; return }
-    if (state !== "show") {
+    if ((parseInt(count) || 0) < Math.max(1, bar.settings.minSelectionChars)) {
       bar.fresh = false
       if (!bar.host.speaking && !bar.menuOpen) bar.hide()
       return
@@ -150,7 +152,7 @@ Scope {
   // Apps update the selection continuously while dragging; wait for it to settle.
   Timer {
     id: settle
-    interval: 350
+    interval: 500
     onTriggered: locate.running = true
   }
 
@@ -181,12 +183,64 @@ Scope {
       bar.menuOpen = false
       bar.targetScreen = screen
       bar.pointerX = cx - m.x
+      bar.monitorX = m.x
+      bar.monitorY = m.y
       bar.pointerY = cy - m.y
       bar.dragX = 0
       bar.dragY = 0
       bar.shown = true
+      Qt.callLater(bar.sampleBackdrop)
       return
     }
+  }
+
+  // ---------------------------------------------------------------- adaptive ink
+  // The capsule's icons and outline are black or white, whichever contrasts
+  // with what is behind it. A small screenshot of that area (grim) gives its
+  // WCAG relative luminance; the hysteresis band stops flicker on mid-greys.
+
+  property bool inkDark: false
+  readonly property color ink: bar.inkDark ? "#000000" : "#ffffff"
+
+  readonly property string luminanceScript: "import re,sys\n"
+    + "d=sys.stdin.buffer.read()\n"
+    + "m=re.match(rb'P6\\s+(\\d+)\\s+(\\d+)\\s+\\d+\\s',d)\n"
+    + "px=d[m.end():] if m else b''\n"
+    + "lin=lambda c:(c/255)/12.92 if c<=10 else ((c/255+0.055)/1.055)**2.4\n"
+    + "n=len(px)//3\n"
+    + "print(sum(0.2126*lin(px[i])+0.7152*lin(px[i+1])+0.0722*lin(px[i+2]) for i in range(0,n*3,3))/n if n else -1)\n"
+
+  function sampleBackdrop() {
+    if (!bar.shown || sampler.running) return
+    var pad = Style.space(4)
+    sampler.command = ["sh", "-c",
+      "grim -g \"$1\" -t ppm - 2>/dev/null | \"$(command -v python3 || echo \"$2\")\" -c \"$3\"", "sh",
+      Math.round(bar.monitorX + pill.x - pad) + "," + Math.round(bar.monitorY + pill.y - pad) + " "
+        + Math.round(pill.width + 2 * pad) + "x" + Math.round(pill.height + 2 * pad),
+      bar.host.pythonPath, bar.luminanceScript]
+    sampler.running = true
+  }
+
+  Process {
+    id: sampler
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var lum = parseFloat(this.text)
+        if (!(lum >= 0)) return
+        // Black and white text have equal contrast at L ≈ 0.18.
+        if (lum > 0.22) bar.inkDark = true
+        else if (lum < 0.14) bar.inkDark = false
+      }
+    }
+  }
+
+  // Pages scroll and windows move under the capsule; re-check while it is up,
+  // faster while it is being dragged.
+  Timer {
+    interval: pillDrag.active ? 100 : 300
+    repeat: true
+    running: bar.shown
+    onTriggered: bar.sampleBackdrop()
   }
 
   // Idle pill disappears on its own; it stays while speaking, paused,
@@ -245,7 +299,7 @@ Scope {
       // Fully transparent capsule: only the outline and icons are drawn, so
       // Hyprland's ignore_alpha rule leaves the page behind it unblurred.
       color: "transparent"
-      borderSpec: bar.glassBorder
+      borderSpec: Border.flat(Util.alpha(bar.ink, 0.35), Math.max(1, Style.space(1)))
       padding: Style.space(3)
       opacity: Math.min(1, bar.presence)
       scale: 0.85 + 0.15 * bar.presence
@@ -280,6 +334,7 @@ Scope {
             // Drop any overshoot past the screen edge so dragging back responds at once.
             bar.dragX = pill.x + pill.width / 2 - pill.homeCenterX
             bar.dragY = pill.y - pill.homeY
+            Qt.callLater(bar.sampleBackdrop)
           }
         }
         onTranslationChanged: {
@@ -456,6 +511,8 @@ Scope {
     property real reveal: 1
     property real pop: 1
     property real nudge: 0
+    foreground: bar.ink
+    Behavior on foreground { ColorAnimation { duration: 90 } }
     iconSize: Style.font.icon
     radius: height / 2
     // Revealed by growing from its own centre (no clipping), so both skip
