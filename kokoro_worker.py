@@ -10,11 +10,13 @@ stdin (commands)
    "volume": 1.0, "play": true, "saveDir": "", "device": "auto", "player": "auto"}
   {"cmd": "speakSelection", "source": "selection|clipboard", ...same as speak}
   {"cmd": "clipboard", "source": "selection|clipboard", "reqId": 7}
+  {"cmd": "pause"} | {"cmd": "resume"} | {"cmd": "seek", "delta": -5.0}
   {"cmd": "stop"} | {"cmd": "quit"}
 
 stdout (events)
   hello{pid, players, player, clipboard} loading{device} ready{device, deviceName}
-  started chunk done stopped clipboard{reqId, text} warning{message} error{message}
+  started chunk done stopped paused resumed position{seconds, total, complete}
+  clipboard{reqId, text} warning{message} error{message}
 
 Hardware: CUDA (NVIDIA) and ROCm (AMD) both appear to PyTorch as "cuda";
 Intel GPUs use "xpu". Any GPU failure falls back to the CPU.
@@ -22,9 +24,11 @@ Audio: pw-cat (PipeWire) > paplay (PulseAudio) > aplay (ALSA), raw float32.
 """
 import json
 import os
+import fcntl
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -32,6 +36,9 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 SAMPLE_RATE = 24000
+BLOCK_SAMPLES = SAMPLE_RATE // 50          # 20 ms per write to the player
+F_SETPIPE_SZ = getattr(fcntl, "F_SETPIPE_SZ", 1031)
+PIPE_BYTES = 8192                          # ~85 ms of audio in flight, so pause/seek feel instant
 REPO_ID = "hexgrad/Kokoro-82M"
 
 _out_lock = threading.Lock()
@@ -104,6 +111,14 @@ class Worker:
         self.cancel = threading.Event()
         self.player = None
         self.thread = None
+        # Playback state for the current job, guarded by self.cond.
+        self.cond = threading.Condition()
+        self.job = 0
+        self.buf = None
+        self.pos = 0
+        self.gen_done = True
+        self.paused = False
+        self.volume = 1.0
 
     # -- model ---------------------------------------------------------------
 
@@ -180,13 +195,25 @@ class Worker:
         return self.pipelines[lang_code]
 
     # -- playback ------------------------------------------------------------
+    # Generated audio collects in self.buf; a playback thread feeds the player
+    # from the playhead self.pos in small blocks, so pause and seek act within
+    # ~0.1 s while generation keeps running ahead.
 
     def open_player(self, wanted):
         name = pick_player(wanted)
         if name is None:
             emit("warning", message="No audio player found (need pw-cat, paplay or aplay); not playing")
             return None
-        return subprocess.Popen(PLAYERS[name], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        # stderr goes to a file: aplay reports every underrun (e.g. while paused),
+        # which could fill an unread pipe and block it.
+        log = tempfile.TemporaryFile()
+        player = subprocess.Popen(PLAYERS[name], stdin=subprocess.PIPE, stderr=log)
+        player.log = log
+        try:
+            fcntl.fcntl(player.stdin.fileno(), F_SETPIPE_SZ, PIPE_BYTES)
+        except (OSError, AttributeError):
+            pass
+        return player
 
     def close_player(self, kill=False):
         player, self.player = self.player, None
@@ -202,10 +229,65 @@ class Worker:
             player.kill()
             return
         if player.returncode != 0:
-            detail = player.stderr.read().decode(errors="replace").strip().splitlines()
+            player.log.seek(0)
+            detail = player.log.read().decode(errors="replace").strip().splitlines()
             emit("error", message="Audio playback failed (%s exit %s)%s" % (
                 os.path.basename(player.args[0]), player.returncode,
                 ": " + detail[-1] if detail else ""))
+
+    def _play(self, job, player):
+        import numpy as np
+
+        last_report = 0.0
+        while True:
+            with self.cond:
+                while not self.cancel.is_set() and (
+                        self.paused or (self.pos >= len(self.buf) and not self.gen_done)):
+                    self.cond.wait(0.2)
+                if self.cancel.is_set() or (self.pos >= len(self.buf) and self.gen_done):
+                    return
+                block = self.buf[self.pos:self.pos + BLOCK_SAMPLES]
+                self.pos += len(block)
+                volume = self.volume
+            out = block if volume == 1.0 else np.clip(block * volume, -1.0, 1.0)
+            try:
+                player.stdin.write(out.astype("float32").tobytes())
+                player.stdin.flush()
+            except (BrokenPipeError, ValueError, OSError):
+                return
+            now = time.time()
+            if now - last_report >= 0.25:
+                last_report = now
+                self.report_position(job)
+
+    def report_position(self, job):
+        with self.cond:
+            pos, total, complete = self.pos, len(self.buf), self.gen_done
+        emit("position", id=job, seconds=round(pos / SAMPLE_RATE, 2),
+             total=round(total / SAMPLE_RATE, 2), complete=complete)
+
+    def pause(self):
+        with self.cond:
+            if self.player is None:
+                emit("warning", message="Nothing is playing")
+                return
+            self.paused = True
+            self.cond.notify_all()
+        emit("paused")
+
+    def resume(self):
+        with self.cond:
+            self.paused = False
+            self.cond.notify_all()
+        emit("resumed")
+
+    def seek(self, delta):
+        with self.cond:
+            if self.player is None:
+                return
+            self.pos = max(0, min(len(self.buf), self.pos + int(float(delta) * SAMPLE_RATE)))
+            self.cond.notify_all()
+        self.report_position(self.job)
 
     # -- speech --------------------------------------------------------------
 
@@ -258,49 +340,60 @@ class Worker:
 
         voice = str(req.get("voice") or "af_heart")
         speed = float(req.get("speed") or 1.0)
-        volume = max(0.0, float(req.get("volume", 1.0)))
         play = bool(req.get("play", True))
         save_dir = str(req.get("saveDir") or "").strip()
 
+        with self.cond:
+            self.job = job
+            self.buf = np.zeros(0, dtype="float32")
+            self.pos = 0
+            self.gen_done = False
+            self.paused = False
+            self.volume = max(0.0, float(req.get("volume", 1.0)))
+
         started = time.time()
-        chunks, samples, first_audio = [], 0, None
+        first_audio = None
         emit("started", id=job, voice=voice, chars=len(text), device=self.device)
+        playback = None
         if play:
             self.player = self.open_player(req.get("player", "auto"))
+            if self.player is not None:
+                playback = threading.Thread(target=self._play, args=(job, self.player), daemon=True)
+                playback.start()
         pipe = self.pipeline(voice[0])
-        for index, result in enumerate(pipe(text, voice=voice, speed=speed, split_pattern=r"\n+")):
-            if self.cancel.is_set():
-                break
-            if result.audio is None:
-                continue
-            audio = result.audio.detach().cpu().numpy().astype("float32")
-            if first_audio is None:
-                first_audio = time.time() - started
-            samples += len(audio)
-            if save_dir:
-                chunks.append(audio)
-            emit("chunk", id=job, index=index, graphemes=result.graphemes[:120],
-                 audioSeconds=round(samples / SAMPLE_RATE, 2))
-            player = self.player
-            if player is not None:
-                out = audio if volume == 1.0 else np.clip(audio * volume, -1.0, 1.0)
-                try:
-                    player.stdin.write(out.astype("float32").tobytes())
-                    player.stdin.flush()
-                except (BrokenPipeError, ValueError, OSError):
+        try:
+            for index, result in enumerate(pipe(text, voice=voice, speed=speed, split_pattern=r"\n+")):
+                if self.cancel.is_set():
                     break
+                if result.audio is None:
+                    continue
+                audio = result.audio.detach().cpu().numpy().astype("float32")
+                if first_audio is None:
+                    first_audio = time.time() - started
+                with self.cond:
+                    self.buf = np.concatenate((self.buf, audio))
+                    total = len(self.buf)
+                    self.cond.notify_all()
+                emit("chunk", id=job, index=index, graphemes=result.graphemes[:120],
+                     audioSeconds=round(total / SAMPLE_RATE, 2))
+        finally:
+            with self.cond:
+                self.gen_done = True
+                self.cond.notify_all()
 
         generated = time.time() - started
         if self.cancel.is_set():
             self.close_player(kill=True)
             emit("stopped", id=job)
             return
-        saved = self.save(chunks, save_dir, voice) if save_dir and chunks else ""
-        self.close_player()
+        saved = self.save([self.buf], save_dir, voice) if save_dir and len(self.buf) else ""
+        if playback is not None:
+            playback.join()  # through any pauses; stop() ends it early
+        self.close_player(kill=self.cancel.is_set())
         if self.cancel.is_set():
             emit("stopped", id=job)
             return
-        audio_seconds = samples / SAMPLE_RATE
+        audio_seconds = len(self.buf) / SAMPLE_RATE
         emit("done", id=job, audioSeconds=round(audio_seconds, 2),
              generateSeconds=round(generated, 2),
              firstAudioSeconds=round(first_audio or 0, 2),
@@ -322,7 +415,9 @@ class Worker:
             return ""
 
     def stop(self):
-        self.cancel.set()
+        with self.cond:
+            self.cancel.set()
+            self.cond.notify_all()
         self.close_player(kill=True)
 
 
@@ -351,6 +446,12 @@ def main():
                 emit("clipboard", reqId=req.get("reqId"), text=read_clipboard(req.get("source", "clipboard")))
             except Exception as exc:  # noqa: BLE001
                 emit("error", message=str(exc))
+        elif cmd == "pause":
+            worker.pause()
+        elif cmd == "resume":
+            worker.resume()
+        elif cmd == "seek":
+            worker.seek(req.get("delta", 0))
         elif cmd == "stop":
             worker.stop()
         elif cmd == "quit":

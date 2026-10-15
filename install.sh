@@ -12,7 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ID="mash2rafi.kokoro"
-PLUGIN_SRC="$SCRIPT_DIR/$PLUGIN_ID"
+PLUGIN_SRC="$SCRIPT_DIR"   # this repo is the plugin folder itself
 PLUGIN_DST="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
 KOKORO_HOME="$HOME/.local/share/kokoro-tts"
 VENV="$KOKORO_HOME/venv"
@@ -78,7 +78,7 @@ fi
 
 step "Detecting your system"
 [[ -f "$PLUGIN_SRC/manifest.json" && -f "$PLUGIN_SRC/kokoro_worker.py" ]] \
-  || die "plugin folder not found next to this script: $PLUGIN_SRC"
+  || die "plugin files not found next to this script in $PLUGIN_SRC"
 [[ "$(uname -m)" == x86_64 || "$(uname -m)" == aarch64 ]] || die "unsupported CPU architecture $(uname -m)"
 ARCH="$(uname -m)"
 
@@ -216,14 +216,21 @@ print("    ✓ model downloaded · torch", torch.__version__, "· device:", dev)
 # --------------------------------------------------------------------------- plugin
 
 step "Omarchy plugin ($PLUGIN_DST)"
-if [[ -d "$PLUGIN_DST" ]] && ! diff -rq --exclude __pycache__ "$PLUGIN_SRC" "$PLUGIN_DST" >/dev/null 2>&1; then
-  # Keep backups out of the plugins folder: Omarchy scans every non-hidden folder there.
-  backup="$KOKORO_HOME/backups/$PLUGIN_ID.$(date +%s)"
-  mkdir -p "$KOKORO_HOME/backups"; mv "$PLUGIN_DST" "$backup"; warn "previous version saved to $backup"
+if [[ "$(realpath "$PLUGIN_SRC")" == "$(realpath -m "$PLUGIN_DST")" ]]; then
+  # Added with `omarchy plugin add <url>`: this checkout already is the plugin; `omarchy plugin update` pulls it.
+  ok "running from the installed checkout; nothing to copy"
+else
+  if [[ -d "$PLUGIN_DST" ]] && ! diff -rq --exclude __pycache__ --exclude .git "$PLUGIN_SRC" "$PLUGIN_DST" >/dev/null 2>&1; then
+    # Keep backups out of the plugins folder: Omarchy scans every non-hidden folder there.
+    backup="$KOKORO_HOME/backups/$PLUGIN_ID.$(date +%s)"
+    mkdir -p "$KOKORO_HOME/backups"; mv "$PLUGIN_DST" "$backup"; warn "previous version saved to $backup"
+  fi
+  mkdir -p "$PLUGIN_DST"
+  for entry in "$PLUGIN_SRC"/* "$PLUGIN_SRC"/.[!.]*; do
+    [[ -e "$entry" && "${entry##*/}" != .git ]] && cp -r "$entry" "$PLUGIN_DST/"
+  done
+  rm -rf "$PLUGIN_DST/__pycache__"
 fi
-mkdir -p "$PLUGIN_DST"
-cp -r "$PLUGIN_SRC/." "$PLUGIN_DST/"
-rm -rf "$PLUGIN_DST/__pycache__"
 omarchy plugin validate "$PLUGIN_DST" >/dev/null || die "plugin failed validation"
 if ! plugin_enabled; then
   cp "$HOME/.config/omarchy/shell.json" "$HOME/.config/omarchy/shell.json.bak.$(date +%s)" 2>/dev/null || true

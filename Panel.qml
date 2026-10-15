@@ -33,7 +33,11 @@ Item {
   property string warningText: ""
   property bool workerAlive: false
   property var pendingCommands: []
-  property bool speaking: false
+  property bool speaking: false   // stays true while paused
+  property bool paused: false
+  property real position: 0      // playhead, seconds
+  property real duration: 0      // audio generated so far, seconds
+  property bool complete: false  // generation finished; duration is final
   property int jobId: 0
   property string progressText: ""
   property string lastResult: ""
@@ -41,6 +45,10 @@ Item {
   property string errorText: ""
   property string lastStderr: ""
   property string page: "speak"
+
+  // Main window opens with a short fade and zoom.
+  property real openAmount: root.opened ? 1 : 0
+  Behavior on openAmount { NumberAnimation { duration: root.opened ? 200 : 0; easing.type: Easing.OutCubic } }
 
   readonly property var fakeBar: QtObject {
     readonly property color foreground: Color.foreground
@@ -74,6 +82,8 @@ Item {
       property int unloadAfterMinutes: 10
       property bool preload: false
       property string hotkeySource: "selection"
+      property bool floatingBar: true
+      property real skipSeconds: 5
       property string player: "auto"
       property string pythonPath: ""
       property string lastText: ""
@@ -91,6 +101,8 @@ Item {
     settings.unloadAfterMinutes = 10
     settings.preload = false
     settings.hotkeySource = "selection"
+    settings.floatingBar = true
+    settings.skipSeconds = 5
     settings.player = "auto"
   }
 
@@ -128,6 +140,7 @@ Item {
       }
       root.unloading = false
       root.speaking = false
+      root.paused = false
       root.pendingCommands = []
       if (root.modelState !== "stopped" && exitCode !== 0) {
         root.modelState = "error"
@@ -194,21 +207,38 @@ Item {
       root.device = ev.device || ""
       root.deviceName = ev.deviceName || ""
       break
+    case "position":
+      if (ev.id !== root.jobId) break
+      root.position = ev.seconds || 0
+      root.duration = ev.total || 0
+      root.complete = !!ev.complete
+      root.progressText = (root.paused ? "Paused · " : "Speaking · ") + root.clock(root.position)
+        + " / " + root.clock(root.duration) + (root.complete ? "" : "…")
+      break
+    case "paused":
+      root.paused = true
+      break
+    case "resumed":
+      root.paused = false
+      break
     case "warning":
       root.warningText = ev.message || ""
       break
     case "started":
       root.speaking = true
+      root.paused = false
       root.progressText = "Generating…"
       break
     case "chunk":
       if (ev.id !== root.jobId) break
       root.modelState = "ready"
-      root.progressText = "Speaking · " + Number(ev.audioSeconds).toFixed(1) + " s generated"
+      root.duration = ev.audioSeconds || 0
+      if (!settings.autoPlay) root.progressText = "Generating · " + root.clock(root.duration)
       break
     case "done":
       if (ev.id !== root.jobId) break
       root.speaking = false
+      root.paused = false
       root.device = ev.device || root.device
       root.progressText = ""
       root.lastResult = Number(ev.audioSeconds).toFixed(1) + " s of audio in "
@@ -219,12 +249,13 @@ Item {
     case "stopped":
       if (ev.id !== root.jobId) break
       root.speaking = false
+      root.paused = false
       root.progressText = ""
       root.lastResult = "Stopped"
       break
     case "error":
       if (ev.id !== undefined && ev.id !== root.jobId) break
-      if (ev.id !== undefined) root.speaking = false
+      if (ev.id !== undefined) { root.speaking = false; root.paused = false }
       root.progressText = ""
       root.errorText = ev.message || "Unknown error"
       if (!root.opened) Quickshell.execDetached(["notify-send", "-a", "Kokoro TTS", "Kokoro TTS", root.errorText])
@@ -254,6 +285,10 @@ Item {
     root.lastSaved = ""
     root.jobId += 1
     root.speaking = true
+    root.paused = false
+    root.position = 0
+    root.duration = 0
+    root.complete = false
     root.progressText = root.modelState === "ready" ? "Generating…" : "Loading model…"
     root.send({
       cmd: "speak",
@@ -273,15 +308,51 @@ Item {
   function stop(arg) {
     if (worker.running) worker.write(JSON.stringify({ cmd: "stop" }) + "\n")
     root.speaking = false
+    root.paused = false
     root.progressText = ""
     return "ok"
+  }
+
+  function pause(arg) {
+    if (!root.speaking || root.paused || !root.workerAlive) return "idle"
+    worker.write(JSON.stringify({ cmd: "pause" }) + "\n")
+    return "ok"
+  }
+
+  function resume(arg) {
+    if (!root.paused || !root.workerAlive) return "idle"
+    worker.write(JSON.stringify({ cmd: "resume" }) + "\n")
+    return "ok"
+  }
+
+  // Jump the playhead by `seconds` (negative = back); clamps to the clip.
+  function skip(seconds) {
+    if (!root.speaking || !root.workerAlive) return "idle"
+    worker.write(JSON.stringify({ cmd: "seek", delta: Number(seconds) || 0 }) + "\n")
+    return "ok"
+  }
+
+  // For keybindings: omarchy-shell shell call mash2rafi.kokoro skipBack ""
+  function skipBack(arg) { return root.skip(-(Number(arg) || settings.skipSeconds)) }
+  function skipForward(arg) { return root.skip(Number(arg) || settings.skipSeconds) }
+
+  function clock(seconds) {
+    var t = Math.max(0, Math.floor(seconds))
+    var sec = t % 60
+    return Math.floor(t / 60) + ":" + (sec < 10 ? "0" : "") + sec
+  }
+
+  // For a keybinding: omarchy-shell shell call mash2rafi.kokoro togglePause ""
+  function togglePause(arg) {
+    return root.paused ? root.resume("") : root.pause("")
   }
 
   // For scripts: omarchy-shell shell call mash2rafi.kokoro statusJson ""
   function statusJson(arg) {
     return JSON.stringify({
       model: root.modelState, device: root.device, deviceName: root.deviceName,
-      player: root.player, warning: root.warningText, speaking: root.speaking,
+      player: root.player, warning: root.warningText, speaking: root.speaking, paused: root.paused,
+      position: root.position, duration: root.duration,
       progress: root.progressText, last: root.lastResult, saved: root.lastSaved,
       error: root.errorText
     })
@@ -365,6 +436,11 @@ Item {
 
   // ---------------------------------------------------------------- UI
 
+  SelectionBar {
+    host: root
+    settings: settings
+  }
+
   readonly property string statusText: {
     switch (root.modelState) {
     case "starting": return "Starting Kokoro…"
@@ -394,6 +470,7 @@ Item {
     Rectangle {
       anchors.fill: parent
       color: Color.menu.scrim
+      opacity: root.openAmount
     }
 
     MouseArea {
@@ -407,9 +484,14 @@ Item {
       width: Math.min(Style.space(620), panel.width - Style.gapsOut * 6)
       height: Math.min(Style.space(600), panel.height - Style.gapsOut * 6)
       radius: Style.cornerRadius
-      color: Color.popups.background
-      borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
+      // Frosted glass, matching the floating bar (Hyprland blurs the "mash2rafi-kokoro" layer).
+      color: Util.alpha(Color.popups.background, 0.62)
+      borderSpec: Border.flat(Util.alpha(Color.popups.text, 0.22), Math.max(1, Style.space(1)))
       padding: Style.spacing.panelPadding + Style.space(6)
+      opacity: root.openAmount
+      scale: 0.96 + 0.04 * root.openAmount
+
+      GlassSheen { radius: card.radius }
 
       MouseArea {
         anchors.fill: parent
@@ -564,17 +646,50 @@ Item {
               }
             }
 
-            Text {
+            // While speaking: back / pause-resume / forward, then the status line.
+            RowLayout {
               Layout.fillWidth: true
-              visible: text.length > 0
-              text: root.errorText.length ? root.errorText
-                : (root.progressText.length ? root.progressText
-                : (root.warningText.length ? root.warningText : root.lastResult))
-              color: root.errorText.length || (!root.progressText.length && root.warningText.length)
-                ? Color.urgent : Color.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.Wrap
+              spacing: Style.spacing.controlGap
+
+              Button {
+                visible: root.speaking && settings.autoPlay
+                iconText: "󰑟"
+                bordered: true
+                verticalPadding: Style.space(3)
+                tooltipText: "Back " + settings.skipSeconds + " s"
+                onClicked: root.skipBack("")
+              }
+
+              Button {
+                visible: root.speaking && settings.autoPlay
+                iconText: root.paused ? "󰐊" : "󰏤"
+                bordered: true
+                verticalPadding: Style.space(3)
+                tooltipText: root.paused ? "Resume" : "Pause"
+                onClicked: root.togglePause("")
+              }
+
+              Button {
+                visible: root.speaking && settings.autoPlay
+                iconText: "󰈑"
+                bordered: true
+                verticalPadding: Style.space(3)
+                tooltipText: "Forward " + settings.skipSeconds + " s"
+                onClicked: root.skipForward("")
+              }
+
+              Text {
+                Layout.fillWidth: true
+                visible: text.length > 0
+                text: root.errorText.length ? root.errorText
+                  : (root.progressText.length ? root.progressText
+                  : (root.warningText.length ? root.warningText : root.lastResult))
+                color: root.errorText.length || (!root.progressText.length && root.warningText.length)
+                  ? Color.urgent : Color.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+              }
             }
 
             RowLayout {
@@ -769,6 +884,15 @@ Item {
                   ]
                   value: settings.hotkeySource
                   onChanged: function(v) { settings.hotkeySource = v }
+                }
+              }
+
+              SettingRow {
+                label: "Floating bar on selection"
+                description: "Show a play/pause button next to the pointer when you select text; right-click it for quick settings"
+                ToggleSwitch {
+                  checked: settings.floatingBar
+                  onToggled: settings.floatingBar = !settings.floatingBar
                 }
               }
 
