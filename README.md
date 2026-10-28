@@ -1,11 +1,34 @@
-# Kokoro TTS — Omarchy plugin (mash2rafi.kokoro)
+<h1 align="center">Kokoro TTS for Omarchy</h1>
+
+<p align="center"><strong>Select any text, click ▶, hear it. Natural local text-to-speech for the Omarchy shell.</strong></p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/version-1.2.0-7aa2f7?style=flat-square" alt="Version 1.2.0" />
+  <img src="https://img.shields.io/badge/Omarchy-plugin-89b4fa?style=flat-square" alt="Omarchy plugin" />
+  <img src="https://img.shields.io/badge/model-Kokoro--82M-ffcc4d?style=flat-square&logo=huggingface&logoColor=black" alt="Kokoro-82M" />
+  <img src="https://img.shields.io/badge/QML-41CD52?style=flat-square&logo=qt&logoColor=white" alt="QML" />
+  <img src="https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.12" />
+  <img src="https://img.shields.io/badge/runs-100%25%20offline-4EAA25?style=flat-square" alt="Runs offline" />
+</p>
 
 Local text-to-speech for the Omarchy shell, powered by
-[hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M). Everything runs on this
-machine; the model downloads once (~330 MB). Omarchy-only edition: for other Quickshell
-desktops use the universal [kokoro-tts](https://github.com/MASH2RAFI/kokoro-tts) package.
+[hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M). Everything runs on your
+machine: no account, no cloud, no API key. The model downloads once (~330 MB).
+Plugin id: `mash2rafi.kokoro`.
+
+## Highlights
+
+- 🗣️ **41 voices** in US and UK English, Spanish, French, Hindi, Italian and Brazilian Portuguese
+- ✨ **Floating play pill**: select text anywhere and a frosted-glass ▶ appears next to the pointer
+- ⏯️ **Pause, resume and skip** back or forward while it speaks
+- ⚡ **GPU accelerated** on NVIDIA (CUDA), AMD (ROCm) and Intel (XPU), with automatic CPU fallback
+- 💾 **Save clips** as WAV files, and unload the model when idle to free VRAM
+- ⌨️ **Scriptable**: bind any key to speak the selection, the clipboard or a string
 
 ## Install
+
+> Requires Omarchy with shell plugins, PipeWire (or PulseAudio/ALSA) and pacman. `install.sh` handles `espeak-ng`, `uv`, Python 3.12, PyTorch and the model.
+
 
 This repo is the plugin folder itself, so either route works. Both need `install.sh` once,
 because the plugin needs a Python environment with PyTorch and Kokoro.
@@ -116,3 +139,7 @@ restarted automatically the next time the model loads (use **Unload model** in
 Settings to force it).
 
 Japanese and Mandarin voices need `misaki[ja]` / `misaki[zh]` and are not listed.
+
+## License
+
+The plugin manifest declares [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0), the same license as the Kokoro-82M model.
